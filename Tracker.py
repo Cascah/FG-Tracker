@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-Tekken 8 player lookup (data from ewgf.gg).
-Hit Run in VS Code, type a player name or Tekken ID (e.g. 3YrT-MtjN-qqBn), get stats.
+Tekken 8 player lookup using the official ewgf.gg API.
+Hit Run in VS Code, paste a Tekken ID (e.g. 3fLQ-T3y9-66qh), get stats
+built from that player's recent ranked matches.
 
-Needs:  python3 -m pip install requests
+Setup:
+  1. python3 -m pip install requests
+  2. Get a free API key: ewgf.gg -> Settings -> Developer tab
+  3. Run the script; it asks for the key once and saves it to ~/.ewgf_key
 """
+import os
 import sys
+from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
 import requests
 
-API_BASES = ["https://api.ewgf.gg", "https://ewgf.gg/api"]
-HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh) fgc-player-lookup/1.0",
-           "Accept": "application/json"}
+API = "https://api.ewgf.gg/external"
+KEY_FILE = Path.home() / ".ewgf_key"
+DEBUG = False  # True prints raw field names from the first battle
 
 CHARACTERS = {
     0: "Paul", 1: "Law", 2: "King", 3: "Yoshimitsu", 4: "Hwoarang", 5: "Xiaoyu", 6: "Jin",
@@ -33,109 +40,143 @@ DAN_RANKS = {
 }
 
 
-def char_name(cid):
-    return CHARACTERS.get(cid, f"Char #{cid}")
+def char_name(c):
+    if isinstance(c, str) and not c.isdigit():
+        return c                      # API already gave a name
+    try:
+        return CHARACTERS.get(int(c), f"Char #{c}")
+    except (TypeError, ValueError):
+        return "?"
 
 
 def dan_name(d):
-    if d is None:
+    if isinstance(d, str) and not d.isdigit():
+        return d
+    try:
+        d = int(d)
+    except (TypeError, ValueError):
         return "-"
-    if d >= 100:  # GoD sub-ranks
+    if d >= 100:
         return "God of Destruction" + (f" {d - 100}" if d > 100 else "")
     return DAN_RANKS.get(d, f"Rank #{d}")
 
 
-def api_get(path, params=None):
-    last = None
-    for base in API_BASES:
-        try:
-            r = requests.get(base + path, params=params, headers=HEADERS, timeout=20)
-            if r.status_code == 404:
-                return None
-            if r.ok:
-                return r.json()
-            last = f"HTTP {r.status_code}"
-        except (requests.RequestException, ValueError) as e:
-            last = str(e)
-    raise RuntimeError(f"Couldn't reach ewgf.gg ({last})")
+# ------------------------------------------------------------- api key -----
+def get_api_key():
+    key = os.environ.get("EWGF_API_KEY")
+    if key:
+        return key.strip()
+    if KEY_FILE.exists():
+        return KEY_FILE.read_text().strip()
+    print("No ewgf.gg API key found. Get a free one at ewgf.gg -> Settings -> Developer.")
+    key = input("Paste your API key (starts with ewgf_): ").strip()
+    if key:
+        KEY_FILE.write_text(key)
+        KEY_FILE.chmod(0o600)
+        print(f"Saved to {KEY_FILE}\n")
+    return key
 
 
-# ------------------------------------------------------------------ search --
-def search(query):
-    q = query.strip()
-    # Tekken IDs are shown as XXXX-XXXX-XXXX but stored without dashes
-    if q.count("-") == 2 and len(q.replace("-", "")) == 12:
-        q = q.replace("-", "")
-    if not q or len(q) >= 20:
-        print("Search must be 1-19 characters.")
-        return []
-    return api_get("/player-stats/search", {"query": q}) or []
+def fetch_battles(tekken_id, key):
+    r = requests.get(f"{API}/battles/{tekken_id}",
+                     headers={"Authorization": f"Bearer {key}"}, timeout=20)
+    try:
+        body = r.json()
+    except ValueError:
+        raise RuntimeError(f"HTTP {r.status_code}, response wasn't JSON")
+    if not r.ok:
+        err = body.get("error", {})
+        code = err.get("code", f"http_{r.status_code}")
+        if code in ("invalid_api_key", "api_key_revoked", "invalid_api_key_format"):
+            KEY_FILE.unlink(missing_ok=True)
+            raise RuntimeError(f"{err.get('message')}\n(Removed saved key - rerun to enter a new one.)")
+        raise RuntimeError(err.get("message", code))
+    meta = body.get("_metadata", {})
+    data = body.get("data", body)
+    if isinstance(data, dict):  # in case battles are nested one level down
+        data = next((v for v in data.values() if isinstance(v, list)), [])
+    return data, meta
 
 
-def pick_player(results):
-    if len(results) == 1:
-        return results[0]
-    print(f"\nFound {len(results)} players:")
-    for i, p in enumerate(results, 1):
-        print(f"  {i:>2}. {p.get('name', '?'):<20} {p.get('formattedTekkenId') or p.get('tekkenId', ''):<16}"
-              f" {p.get('mostPlayedCharacter') or '':<12} {p.get('danRankName') or p.get('DanRankName') or ''}")
-    while True:
-        choice = input("Pick a number (Enter to cancel): ").strip()
-        if not choice:
-            return None
-        if choice.isdigit() and 1 <= int(choice) <= len(results):
-            return results[int(choice) - 1]
-        print("Not a valid number.")
+# ------------------------------------------------------ field handling -----
+def norm(d):
+    """Make keys comparable: player1PolarisId / player1_polaris_id -> player1polarisid"""
+    return {k.replace("_", "").lower(): v for k, v in d.items()} if isinstance(d, dict) else {}
 
 
-# ------------------------------------------------------------------- stats --
-def show_stats(p):
-    print("\n" + "=" * 60)
-    print(f"  {p.get('name')}   (Tekken ID: {p.get('polarisId')})")
-    print(f"  Tekken Power: {p.get('tekkenPower', 0):,}")
-    main = p.get("mainCharacterAndRank") or {}
-    if main:
-        print("  Main: " + ", ".join(f"{k}: {v}" for k, v in main.items()))
-    print("=" * 60)
+def side(b, n, field):
+    for k in (f"player{n}{field}", f"p{n}{field}"):
+        if k in b:
+            return b[k]
+    return None
 
-    chars = p.get("playedCharacters") or {}
-    if chars:
-        print(f"\n  {'Character':<14}{'W':>6}{'L':>6}{'Win %':>8}   Rank")
-        ranked = sorted(chars.items(), key=lambda kv: kv[1].get("wins", 0) + kv[1].get("losses", 0),
-                        reverse=True)
-        for name, s in ranked:
-            w, l = s.get("wins", 0), s.get("losses", 0)
-            wr = s.get("characterWinrate")
-            wr = wr if wr is not None else (100 * w / (w + l) if w + l else 0)
-            print(f"  {name:<14}{w:>6}{l:>6}{wr:>7.1f}%   {dan_name(s.get('currentSeasonDanRank'))}")
 
-        top_name, top = ranked[0]
-        best, worst = top.get("bestMatchup") or {}, top.get("worstMatchup") or {}
-        if best or worst:
-            print(f"\n  {top_name} matchups:")
-            for label, m in (("Best", best), ("Worst", worst)):
-                for opp, rate in m.items():
-                    print(f"    {label:<6} vs {opp:<14}{rate:.1f}%")
+# ----------------------------------------------------------------- stats ---
+def show_stats(tekken_id, battles):
+    tid = tekken_id.replace("-", "").lower()
+    if DEBUG and battles:
+        print("  [debug] battle fields:", sorted(battles[0].keys()))
 
-    battles = p.get("battles") or []
-    if battles:
-        me = p.get("polarisId")
-        print(f"\n  Last {min(10, len(battles))} matches:")
-        for b in battles[:10]:
-            p1 = b.get("player1PolarisId") == me
-            my_char = char_name(b.get("player1CharacterId") if p1 else b.get("player2CharacterId"))
-            opp = b.get("player2Name") if p1 else b.get("player1Name")
-            opp_char = char_name(b.get("player2CharacterId") if p1 else b.get("player1CharacterId"))
-            mine = b.get("player1RoundsWon") if p1 else b.get("player2RoundsWon")
-            theirs = b.get("player2RoundsWon") if p1 else b.get("player1RoundsWon")
-            won = (b.get("winner") == 1) == p1
-            print(f"    {'W' if won else 'L'}  {mine}-{theirs}  {my_char:<11} vs {opp_char:<11} ({opp})"
-                  f"  {fmt_date(b.get('date'))}")
+    rows = []
+    for raw in battles:
+        b = norm(raw)
+        p1 = str(side(b, 1, "polarisid") or side(b, 1, "tekkenid") or "").replace("-", "").lower()
+        me, opp = (1, 2) if p1 == tid else (2, 1)
+        winner = b.get("winner")
+        rows.append({
+            "name": side(b, me, "name"),
+            "char": char_name(side(b, me, "characterid") or side(b, me, "character")),
+            "rank": side(b, me, "danrank"),
+            "power": side(b, me, "tekkenpower"),
+            "opp": side(b, opp, "name"),
+            "opp_char": char_name(side(b, opp, "characterid") or side(b, opp, "character")),
+            "mine": side(b, me, "roundswon"),
+            "theirs": side(b, opp, "roundswon"),
+            "won": str(winner) == str(me),
+            "date": b.get("date") or b.get("battleat") or b.get("battletime"),
+        })
+
+    latest = rows[0]
+    print("\n" + "=" * 62)
+    print(f"  {latest['name']}   (Tekken ID: {tekken_id})")
+    if latest["power"]:
+        print(f"  Tekken Power: {int(latest['power']):,}")
+    wins = sum(r["won"] for r in rows)
+    print(f"  Last {len(rows)} ranked: {wins}W - {len(rows) - wins}L  ({100 * wins / len(rows):.1f}%)")
+    print("=" * 62)
+
+    per_char = defaultdict(lambda: {"w": 0, "l": 0, "rank": None})
+    matchups = defaultdict(lambda: {"w": 0, "l": 0})
+    for r in rows:
+        c = per_char[r["char"]]
+        c["w" if r["won"] else "l"] += 1
+        if c["rank"] is None:
+            c["rank"] = r["rank"]     # rows are newest-first, so first seen = current
+        matchups[r["opp_char"]]["w" if r["won"] else "l"] += 1
+
+    print(f"\n  {'Character':<14}{'W':>5}{'L':>5}{'Win %':>8}   Rank")
+    for name, s in sorted(per_char.items(), key=lambda kv: -(kv[1]["w"] + kv[1]["l"])):
+        n = s["w"] + s["l"]
+        print(f"  {name:<14}{s['w']:>5}{s['l']:>5}{100 * s['w'] / n:>7.1f}%   {dan_name(s['rank'])}")
+
+    frequent = [(k, v) for k, v in matchups.items() if v["w"] + v["l"] >= 3]
+    if frequent:
+        frequent.sort(key=lambda kv: kv[1]["w"] / (kv[1]["w"] + kv[1]["l"]))
+        print("\n  Matchups (3+ games):")
+        for k, v in frequent:
+            n = v["w"] + v["l"]
+            print(f"    vs {k:<14}{v['w']}-{v['l']}  ({100 * v['w'] / n:.0f}%)")
+
+    print(f"\n  Last {min(10, len(rows))} matches:")
+    for r in rows[:10]:
+        score = f"{r['mine']}-{r['theirs']}" if r["mine"] is not None else "   "
+        print(f"    {'W' if r['won'] else 'L'}  {score}  {r['char']:<11} vs {r['opp_char']:<11}"
+              f" ({r['opp']})  {fmt_date(r['date'])}")
     print()
 
 
 def fmt_date(d):
-    if not d:
+    if d is None:
         return ""
     try:
         if str(d).isdigit():
@@ -145,33 +186,37 @@ def fmt_date(d):
         return str(d)
 
 
-# -------------------------------------------------------------------- main --
+# ------------------------------------------------------------------ main ---
 def main():
+    key = get_api_key()
+    if not key:
+        print("Need an API key to continue.")
+        return 1
     print("Tekken 8 Player Lookup (ewgf.gg)  -  type 'q' to quit")
     while True:
         try:
-            query = input("\nPlayer name or Tekken ID: ").strip()
+            q = input("\nTekken ID: ").strip()
         except (EOFError, KeyboardInterrupt):
             break
-        if query.lower() in ("q", "quit", "exit"):
+        if q.lower() in ("q", "quit", "exit"):
             break
+        tid = q.replace("-", "")
+        if not (tid.isalnum() and len(tid) <= 20):
+            print("That doesn't look like a Tekken ID (letters/numbers, like 3fLQ-T3y9-66qh).")
+            print("Name search isn't available through the ewgf.gg API.")
+            continue
         try:
-            results = search(query)
-            if not results:
-                print("No players found. (ewgf.gg only knows players who've played ranked recently.)")
-                continue
-            chosen = pick_player(results)
-            if not chosen:
-                continue
-            pid = chosen.get("tekkenId") or chosen.get("id")
-            stats = api_get(f"/player-stats/{pid}")
-            if not stats:
-                print("Couldn't load that player's stats.")
-                continue
-            show_stats(stats)
-        except RuntimeError as e:
-            print(e)
+            battles, meta = fetch_battles(tid, key)
+            if not battles:
+                print("That player has no recent ranked matches.")
+            else:
+                show_stats(q, battles)
+            if meta.get("rate_limit_remaining") is not None:
+                print(f"  (API requests left this hour: {meta['rate_limit_remaining']})")
+        except (RuntimeError, requests.RequestException) as e:
+            print(f"Error: {e}")
     print("Bye!")
+    return 0
 
 
 if __name__ == "__main__":
